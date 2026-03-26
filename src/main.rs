@@ -1,12 +1,9 @@
-mod chain;
 mod cli;
-mod error;
-mod model;
-mod output_formatter;
+
+use rtxe::chain;
 
 use clap::Parser;
 use cli::{Cli, Commands};
-use output_formatter::OutputFormatter;
 
 #[tokio::main]
 async fn main() {
@@ -28,12 +25,11 @@ async fn main() {
             };
 
             match explainer.explain_dyn(&hash).await {
-                Ok(explanation) => {
-                    let formatter = OutputFormatter::new();
+                Ok(output) => {
                     if json {
-                        print!("{}", formatter.format_json(&explanation));
+                        println!("{}", serde_json::to_string_pretty(&output.json).unwrap());
                     } else {
-                        print!("{}", formatter.format_text(&explanation));
+                        print!("{}", output.text);
                     }
                 }
                 Err(e) => {
