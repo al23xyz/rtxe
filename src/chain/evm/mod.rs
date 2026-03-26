@@ -12,13 +12,141 @@ use alloy::rpc::types::trace::geth::{
     CallFrame, GethDebugBuiltInTracerType, GethDebugTracerType, GethDebugTracingOptions,
     GethTrace,
 };
+use serde::Serialize;
 
-use crate::chain::ChainExplainer;
+use crate::chain::{ChainExplainer, ExplainOutput};
 use crate::error::RtxeError;
-use crate::model::{Action, ActionType, TxExplanation, TxStatus};
 
 use abi_registry::AbiRegistry;
 use token_resolver::{TokenInfo, TokenResolver};
+
+// --- EVM-specific model types ---
+
+#[derive(Debug, Serialize)]
+struct TxExplanation {
+    chain_type: String,
+    tx_hash: String,
+    status: TxStatus,
+    block_number: Option<u64>,
+    from: String,
+    to: Option<String>,
+    value: String,
+    gas_used: Option<u64>,
+    gas_price: Option<String>,
+    fee: Option<String>,
+    function_called: Option<String>,
+    actions: Vec<Action>,
+    summary: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+enum TxStatus {
+    Success,
+    Failure { revert_reason: Option<String> },
+    Pending,
+}
+
+#[derive(Debug, Serialize)]
+struct Action {
+    index: usize,
+    action_type: ActionType,
+    description: String,
+    contract: String,
+}
+
+#[derive(Debug, Serialize)]
+enum ActionType {
+    Transfer,
+    Approval,
+    Swap,
+    Mint,
+    Burn,
+    InternalTransfer,
+    Unknown,
+}
+
+impl std::fmt::Display for TxStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TxStatus::Success => write!(f, "Success"),
+            TxStatus::Failure { revert_reason } => match revert_reason {
+                Some(reason) => write!(f, "Failed: {reason}"),
+                None => write!(f, "Failed"),
+            },
+            TxStatus::Pending => write!(f, "Pending"),
+        }
+    }
+}
+
+impl std::fmt::Display for ActionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ActionType::Transfer => write!(f, "Transfer"),
+            ActionType::Approval => write!(f, "Approval"),
+            ActionType::Swap => write!(f, "Swap"),
+            ActionType::Mint => write!(f, "Mint"),
+            ActionType::Burn => write!(f, "Burn"),
+            ActionType::InternalTransfer => write!(f, "InternalTransfer"),
+            ActionType::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+// --- Formatting ---
+
+fn format_text(explanation: &TxExplanation) -> String {
+    let mut out = String::new();
+
+    out.push_str(&format!("Transaction: {}\n", explanation.tx_hash));
+    out.push_str(&format!(
+        "Chain: {}\n",
+        explanation.chain_type.to_uppercase()
+    ));
+    out.push_str(&format!("Status: {}\n", explanation.status));
+
+    if let Some(block) = explanation.block_number {
+        out.push_str(&format!("Block: {block}\n"));
+    }
+
+    out.push('\n');
+    out.push_str(&format!("From: {}\n", explanation.from));
+
+    match &explanation.to {
+        Some(to) => out.push_str(&format!("To: {to}\n")),
+        None => out.push_str("To: (Contract Creation)\n"),
+    }
+
+    out.push_str(&format!("Value: {}\n", explanation.value));
+
+    if let Some(fee) = &explanation.fee {
+        out.push_str(&format!("Fee: {fee}\n"));
+    }
+
+    if let Some(func) = &explanation.function_called {
+        out.push_str(&format!("\nFunction Called: {func}\n"));
+    }
+
+    if !explanation.actions.is_empty() {
+        out.push_str(&format!(
+            "\nActions ({} events):\n",
+            explanation.actions.len()
+        ));
+        for action in &explanation.actions {
+            out.push_str(&format!(
+                "  {}. [{}] {}\n",
+                action.index, action.action_type, action.description
+            ));
+        }
+    }
+
+    if let Some(summary) = &explanation.summary {
+        out.push_str(&format!("\nSummary: {summary}\n"));
+    }
+
+    out
+}
+
+// --- EvmExplainer ---
 
 pub struct EvmExplainer {
     provider: RootProvider,
@@ -147,7 +275,6 @@ impl EvmExplainer {
 
     fn extract_internal_transfers(trace: &GethTrace, actions: &mut Vec<Action>) {
         if let GethTrace::CallTracer(frame) = trace {
-            // Skip the top-level call (it's the tx itself), only process sub-calls
             for sub in &frame.calls {
                 Self::walk_call_frame(sub, actions);
             }
@@ -155,7 +282,6 @@ impl EvmExplainer {
     }
 
     fn walk_call_frame(frame: &CallFrame, actions: &mut Vec<Action>) {
-        // Record CALL frames with non-zero value (internal ETH transfers)
         let value = frame.value.unwrap_or(U256::ZERO);
         if !value.is_zero() {
             let next_idx = actions.len() + 1;
@@ -191,7 +317,6 @@ impl EvmExplainer {
             .collect();
 
         if has_swap && transfers.len() >= 2 {
-            // Summarize as a swap using the first and last transfer descriptions
             Some(format!(
                 "Token swap involving {} transfers.",
                 transfers.len()
@@ -230,7 +355,7 @@ impl EvmExplainer {
 }
 
 impl ChainExplainer for EvmExplainer {
-    async fn explain(&self, tx_hash: &str) -> Result<TxExplanation, RtxeError> {
+    async fn explain(&self, tx_hash: &str) -> Result<ExplainOutput, RtxeError> {
         let hash: TxHash = tx_hash
             .parse()
             .map_err(|_| RtxeError::InvalidTxHash(tx_hash.to_string()))?;
@@ -341,7 +466,7 @@ impl ChainExplainer for EvmExplainer {
 
         let summary = Self::generate_summary(&actions);
 
-        Ok(TxExplanation {
+        let explanation = TxExplanation {
             chain_type: "evm".to_string(),
             tx_hash: tx_hash.to_string(),
             status,
@@ -355,6 +480,11 @@ impl ChainExplainer for EvmExplainer {
             function_called,
             actions,
             summary,
-        })
+        };
+
+        let text = format_text(&explanation);
+        let json = serde_json::to_value(&explanation).map_err(RtxeError::Serialization)?;
+
+        Ok(ExplainOutput { text, json })
     }
 }
