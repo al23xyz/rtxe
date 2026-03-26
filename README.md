@@ -3,7 +3,7 @@
 A CLI tool that makes blockchain transactions readable for AI agents. Think block explorer, but outputting structured text that LLMs can reason about.
 
 ```
-rtxe explain --hash <TX_HASH> --rpc <RPC_URL> --type evm
+rtxe explain --hash <TX_HASH> --rpc <RPC_URL> --type <evm|solana>
 ```
 
 ## Why?
@@ -16,14 +16,20 @@ AI agents working with blockchain data spend too much effort parsing raw transac
 # Build
 cargo build --release
 
-# Explain a transaction
+# Explain an EVM transaction
 ./target/release/rtxe explain \
     --hash 0xbfc187a25273a50a893367e64a5637235de3ffe3de0491be820b35418b36a5fe \
     --rpc https://ethereum-rpc.publicnode.com \
     --type evm
+
+# Explain a Solana transaction
+./target/release/rtxe explain \
+    --hash 5qL1Gh186s6dLdp3i9c2uUbA5xgFriZR3so44jfDERF2jzd4D7sCEdB5ewNUQCbgVV9AUxfA3CorPPusbk1m65AZ \
+    --rpc https://api.mainnet-beta.solana.com \
+    --type solana
 ```
 
-### Output
+### EVM Output
 
 ```
 Transaction: 0xbfc187a25273a50a893367e64a5637235de3ffe3de0491be820b35418b36a5fe
@@ -46,58 +52,94 @@ Actions (5 events):
 Summary: Token swap involving 3 transfers.
 ```
 
+### Solana Output
+
+```
+Transaction: 5qL1Gh186s6dLdp3i9c2uUbA5xgFriZR3so44jfDERF2jzd4D7sCEdB5ewNUQCbgVV9AUxfA3CorPPusbk1m65AZ
+Chain: SOLANA
+Status: Success
+Slot: 408794296
+
+Fee Payer: 4cLvukZZjVi7drrtDUQCQukdYVirmhnFMpFtvpTGCdpy
+Fee: 0.000057466 SOL
+Compute Units: 83624
+
+Actions (7 instructions):
+  1. [ProgramInvocation] Instruction to program ComputeBudget111111111111111111111111111111
+  2. [ProgramInvocation] Instruction to program ComputeBudget111111111111111111111111111111
+  3. [AccountCreation] Create associated token account for wallet 4cLvukZZjVi7drrtDUQCQukdYVirmhnFMpFtvpTGCdpy (mint: So11111111111111111111111111111111111111112)
+  4. [Transfer] 0.01 SOL from 4cLvukZZjVi7drrtDUQCQukdYVirmhnFMpFtvpTGCdpy to GF5DDFTTuwi4cLLUrQ2xqnc2hrKAYBCaYhXPGfPznKs7
+  5. [ProgramInvocation] spl-token::syncNative
+  6. [ProgramInvocation] Instruction to program JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4
+  7. [ProgramInvocation] spl-token::closeAccount
+
+Summary: 1 transfer(s) with 1 account creation(s).
+```
+
 ## CLI Reference
 
 | Flag | Description | Default |
 |------|-------------|---------|
-| `--hash` | Transaction hash | required |
+| `--hash` | Transaction hash or signature | required |
 | `--rpc` | RPC endpoint URL | required |
-| `--type` | Chain type (`evm`) | `evm` |
+| `--type` | Chain type (`evm`, `solana`) | `evm` |
 | `--json` | Output as JSON | `false` |
 
 ## What It Does
 
-**Fetches** transaction data, receipt, and trace (when available) from any EVM-compatible RPC.
+Each chain has its own explainer that fetches, decodes, and formats transaction data independently.
 
-**Decodes** events and calldata using a built-in ABI registry:
-- Token standards — ERC-20, ERC-721, ERC-1155
-- WETH — Deposit, Withdrawal
-- Uniswap V2 — Swap, Mint, Burn, Sync (Pair + Router)
-- Uniswap V3 — Swap, Mint, Burn (Pool + Router)
+### EVM
 
-**Resolves** token metadata (symbol, decimals) on-chain via ERC-20 calls, cached per-run.
+- Fetches transaction + receipt (and optionally trace via `debug_traceTransaction`)
+- Decodes events using built-in ABI registry: ERC-20, ERC-721, ERC-1155, WETH, Uniswap V2/V3
+- Resolves token metadata (symbol, decimals) on-chain via ERC-20 calls
+- Extracts internal ETH transfers from call traces
 
-**Traces** internal ETH transfers via `debug_traceTransaction` using the `callTracer`. Gracefully skipped if the RPC doesn't support it.
+### Solana
 
-**Formats** everything into plain text or JSON (`--json`), with full unshortened addresses for reliable cross-referencing by AI agents.
+- Fetches transaction with `jsonParsed` encoding for pre-decoded instructions
+- Decodes System Program (SOL transfers, account creation), SPL Token (transfers, approvals, mints, burns), and Associated Token Account (ATA creation)
+- Shows fee payer, signers, compute units consumed
+- Unknown programs shown with their program ID
+
+### Common
+
+- Full addresses in output for AI agent cross-referencing
+- Plain text (default) or JSON (`--json`) output
+- Graceful error handling
 
 ## Supported Chains
 
 | Chain | Status |
 |-------|--------|
 | EVM (Ethereum, Polygon, Arbitrum, Base, etc.) | Supported |
-| Solana | Planned |
+| Solana | Supported |
 | Bitcoin | Planned |
 
 ## Architecture
 
 ```
 src/
-├── main.rs                    # Entry point
-├── cli.rs                     # clap CLI definitions
-├── error.rs                   # Error types
-├── model.rs                   # TxExplanation, Action, ActionType
-├── output_formatter.rs        # Text and JSON rendering
+├── main.rs                        # Entry point
+├── cli.rs                         # clap CLI definitions
+├── error.rs                       # Error types
 └── chain/
-    ├── mod.rs                 # ChainExplainer trait + factory
-    └── evm/
-        ├── mod.rs             # EvmExplainer
-        ├── abi_registry.rs    # ABI registry with event/function decoding
-        ├── token_resolver.rs  # On-chain ERC-20 metadata resolution
-        └── abis/              # Embedded JSON ABI files
+    ├── mod.rs                     # ChainExplainer trait + factory
+    ├── evm/
+    │   ├── mod.rs                 # EvmExplainer (model, formatting, RPC)
+    │   ├── abi_registry.rs        # ABI registry with event/function decoding
+    │   ├── token_resolver.rs      # On-chain ERC-20 metadata resolution
+    │   └── abis/                  # Embedded JSON ABI files
+    └── solana/
+        ├── mod.rs                 # SolanaExplainer (model, formatting, RPC)
+        ├── instruction_decoder.rs # Decode known Solana program instructions
+        └── token_resolver.rs      # SPL token metadata (placeholder)
 ```
 
-Built with [alloy-rs](https://alloy.rs/) for all EVM interactions.
+Each chain explainer owns its model types and output formatting — no shared model across chains.
+
+Built with [alloy-rs](https://alloy.rs/) for EVM and [solana-client](https://crates.io/crates/solana-client) for Solana.
 
 ## License
 
